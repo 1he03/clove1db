@@ -21,7 +21,7 @@ pub struct DatabaseManager {
     // L2: Persistent database (redb) for long-term storage
     pub db: Arc<Database>,
 
-    // L3: Backup manager (backup.rs) only for monthly backup (optional)
+    // L3: Backup manager (backup.rs) (optional)
     pub backup_manager: Option<BackupManager>, 
 
     // Date
