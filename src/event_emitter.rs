@@ -34,7 +34,7 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-// ── Log Event — ما يُبثّ لكل مشترك ───────────────────────────────────────────
+// ── Log Event — what is broadcasted to each subscriber ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {

@@ -25,11 +25,13 @@ impl<E: Entity> Domain<E> {
 
     pub async fn get<O: OutputDto<E>>(&self, id: &str) -> Result<O> {
         let entity = self.repository.get(id).await?;
+        self.emitter.info(format!("get → {}", id));
         Ok(O::from_entity(entity))
     }
 
     pub async fn list<O: OutputDto<E>>(&self) -> Result<Vec<O>> {
         let entities = self.repository.list().await?;
+        self.emitter.info(format!("list → {} item(s)", entities.len()));
         Ok(O::from_entities(entities))
     }
 
@@ -46,6 +48,18 @@ impl<E: Entity> Domain<E> {
     pub async fn delete(&self, id: &str) -> Result<()> {
         self.repository.delete(id).await?;
         self.emitter.info(format!("deleted → {}", id));
+        Ok(())
+    }
+
+    pub async fn restore_by_version(&self, id: &str, version: u64) -> Result<()> {
+        self.repository.restore_by_version(id, version).await?;
+        self.emitter.info(format!("restored → {} from v{}", id, version));
+        Ok(())
+    }
+
+    pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
+        self.repository.restore_at(id, timestamp).await?;
+        self.emitter.info(format!("restored → {} at ts {}", id, timestamp));
         Ok(())
     }
 

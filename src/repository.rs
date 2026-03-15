@@ -1,5 +1,5 @@
 // use crate::emitter::LogEventEmitter;
-use crate::{backup::BackupManager, event_emitter::EventEmitter, units::{ClError, Result}};
+use crate::{backup::{BackupManager, BackupOperation, BackupRecord}, event_emitter::EventEmitter, units::{ClError, Result}};
 // use crate::units::{CACHE_IDLE_SECONDS, CACHE_MAX_CAPACITY, CACHE_TTL_SECONDS};
 use chrono::{Datelike, Local};
 use itertools::Itertools;
@@ -35,6 +35,8 @@ pub struct DatabaseManager {
 
     // Tables names
     pub tables_names: Vec<String>,
+
+    emitter: Arc<EventEmitter>,
 }
 
 impl DatabaseManager {
@@ -104,6 +106,7 @@ impl DatabaseManager {
             dir: dir_local,
             db_name: db_name.to_string(),
             tables_names: tables,
+            emitter: emitter.clone()
         })
     }
 
@@ -224,6 +227,93 @@ impl DatabaseManager {
         Ok(found)
     }
 
+    pub async fn restore_by_version<'db>(
+        &self,
+        table:      TableDefinition<'db, &str, &[u8]>,
+        table_name: &str,
+        key:        &str,
+        version:    u64,
+    ) -> Result<()> {
+        let bm = self.backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+    
+        // Read the specified record directly
+        let backup_key = format!("{}:{}", key, version);
+        let read_txn   = self.backup_manager.as_ref().unwrap().db.begin_read()?;
+        let tbl        = read_txn.open_table(table)?;
+    
+        let record = tbl
+            .get(backup_key.as_str())?
+            .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+            .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)))?;
+    
+        drop(read_txn);
+    
+        match record.operation {
+            // Set or Restore → Write data to Primary + Cache + Backup
+            BackupOperation::Set | BackupOperation::Restore => {
+                let data = record.data.clone().unwrap();
+    
+                // Primary DB
+                let write_txn = self.db.begin_write()?;
+                { write_txn.open_table(table)?.insert(key, data.as_slice())?; }
+                write_txn.commit()?;
+    
+                // Cache
+                let cache_key = format!("{}:{}", table_name, key);
+                self.memory_cache.insert(cache_key, data.clone()).await;
+    
+                // Backup record_restore
+                bm.record_restore(table, table_name, key, version, Some(data))?;
+            }
+    
+            // Delete → Delete from Primary + Cache + log restore with None
+            BackupOperation::Delete => {
+                let write_txn = self.db.begin_write()?;
+                { write_txn.open_table(table)?.remove(key)?; }
+                write_txn.commit()?;
+    
+                let cache_key = format!("{}:{}", table_name, key);
+                self.memory_cache.invalidate(&cache_key).await;
+    
+                bm.record_restore(table, table_name, key, version, None)?;
+            }
+        }
+    
+        self.emitter.info(format!(
+            "restored → {}:{} from v{}",
+            table_name, key, version
+        ));
+    
+        Ok(())
+    }
+    
+    pub async fn restore_at<'db>(
+        &self,
+        table:      TableDefinition<'db, &str, &[u8]>,
+        table_name: &str,
+        key:        &str,
+        timestamp:  i64,
+    ) -> Result<()> {
+        let bm = self.backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+    
+        // Search for the last record before the timestamp
+        let record = bm
+            .history(table, key)?
+            .into_iter()
+            .filter(|r| r.timestamp <= timestamp)
+            .last()
+            .ok_or_else(|| ClError::NotFound("no record at this timestamp".into()))?;
+    
+        let target_version = record.version;
+    
+        // Same logic as restore_by_version
+        self.restore_by_version(table, table_name, key, target_version).await
+    }
+
     /// Get database reference (for repositories)
     pub fn db(&self) -> &Arc<Database> {
         &self.db
@@ -321,4 +411,19 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .await?;
         Ok(())
     }
+
+    pub async fn restore_by_version(&self, id: &str, version: u64) -> Result<()> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        self.database_manager
+            .restore_by_version(table, self.table, id, version)
+            .await
+    }
+    
+    pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        self.database_manager
+            .restore_at(table, self.table, id, timestamp)
+            .await
+    }
+    
 }

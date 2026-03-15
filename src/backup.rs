@@ -14,6 +14,7 @@ fn version_table_name(table_name: &str) -> String {
 pub enum BackupOperation {
     Set,
     Delete,
+    Restore,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,6 +26,7 @@ pub struct BackupRecord {
     pub table:     String,
     pub key:       String,
     pub data:      Option<Vec<u8>>,  // None on Delete
+    pub restored_version: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,10 +62,10 @@ impl BackupManager {
         Ok(())
     }
 
-    /// يُستدعى من DatabaseManager::set()
+    /// Called from DatabaseManager::set()
     pub fn record_set<'db>(
         &self,
-        table: TableDefinition<'db, &str, &[u8]>,  // ← الـ TableDefinition
+        table: TableDefinition<'db, &str, &[u8]>,  // ← The TableDefinition
         table_name: &str,
         key: &str,
         data: Vec<u8>,
@@ -77,14 +79,15 @@ impl BackupManager {
             table:     table_name.to_string(),
             key:       key.to_string(),
             data:      Some(data),
+            restored_version: None,
         };
         self.write(table, table_name, key, version, &record)
     }
 
-    /// يُستدعى من DatabaseManager::delete()
+    /// Called from DatabaseManager::delete()
     pub fn record_delete<'db>(
         &self,
-        table: TableDefinition<'db, &str, &[u8]>,  // ← الـ TableDefinition
+        table: TableDefinition<'db, &str, &[u8]>,  // ← The TableDefinition
         table_name: &str,
         key: &str,
     ) -> Result<()> {
@@ -98,11 +101,37 @@ impl BackupManager {
             table:     table_name.to_string(),
             key:       key.to_string(),
             data:      None,
+            restored_version: None,
         };
         self.write(table, table_name, key, version, &record)
     }
 
-    /// استرجع تاريخ key معين — مرتب من الأقدم للأحدث
+    pub fn record_restore<'db>(
+        &self,
+        table:            TableDefinition<'db, &str, &[u8]>,
+        table_name:       &str,
+        key:              &str,
+        restored_version: u64,
+        data:             Option<Vec<u8>>,  // None = Was Delete
+    ) -> Result<()> {
+        let version = self.next_version(table_name, key)?;
+    
+        let record = BackupRecord {
+            version,
+            timestamp:        Local::now().timestamp_millis(),
+            date:             Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            operation:        BackupOperation::Restore,
+            table:            table_name.to_string(),
+            key:              key.to_string(),
+            restored_version: Some(restored_version),
+            data,
+        };
+    
+        self.write(table, table_name, key, version, &record)
+    }
+    
+
+    /// Retrieve history of a specific key — ordered from oldest to newest
     pub fn history<'db>(
         &self,
         table:      TableDefinition<'db, &str, &[u8]>,
@@ -123,8 +152,8 @@ impl BackupManager {
         Ok(records)
     }
 
-    /// آخر نسخة من البيانات قبل timestamp معين
-    pub fn restore_at<'db>(
+    /// The last version of data before a specific timestamp
+    pub fn view_at<'db>(
         &self,
         table:     TableDefinition<'db, &str, &[u8]>,
         key:       &str,
@@ -136,11 +165,12 @@ impl BackupManager {
             .last()
             .and_then(|r| match r.operation {
                 BackupOperation::Set    => r.data,
+                BackupOperation::Restore => r.data,
                 BackupOperation::Delete => None,
             }))
     }
 
-    pub fn restore_by_version<'db>(
+    pub fn view_by_version<'db>(
         &self,
         table:   TableDefinition<'db, &str, &[u8]>,
         key:     &str,
@@ -155,6 +185,7 @@ impl BackupManager {
             .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
             .and_then(|r| match r.operation {
                 BackupOperation::Set    => r.data,
+                BackupOperation::Restore => r.data,
                 BackupOperation::Delete => None,
             }))
     }

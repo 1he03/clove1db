@@ -26,7 +26,7 @@ const LOG_CHANNEL_CAPACITY: usize = 1024;
 struct StorageInner {
     emitter:          Arc<EventEmitter>,
     domains:          HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    // نحتفظ بهم للـ maintenance (backup update، إلخ)
+    // We keep them for maintenance (backup update, etc.)
     database_managers: HashMap<String, DatabaseManager>,
 }
 
@@ -40,25 +40,25 @@ impl Storage {
         StorageBuilder::new(config)
     }
 
-    /// استدعاء Domain<E>
+    /// Invoke Domain<E>
     pub fn domain<E: Entity>(&self) -> &Domain<E> {
         self.0
             .domains
             .get(&TypeId::of::<E>())
             .and_then(|b| b.downcast_ref::<Domain<E>>())
             .unwrap_or_else(|| panic!(
-                "[Storage] Domain<{}> غير مسجّل",
+                "[Storage] Domain<{}> not registered",
                 std::any::type_name::<E>()
             ))
     }
 
-    /// وصول لـ DatabaseManager معيّن بالاسم
+    /// Access a specific DatabaseManager by name
     pub fn db_manager(&self, name: &str) -> &DatabaseManager {
         self.0
             .database_managers
             .get(name)
             .unwrap_or_else(|| panic!(
-                "[Storage] DatabaseManager '{}' غير موجود",
+                "[Storage] DatabaseManager '{}' not found",
                 name
             ))
     }
@@ -121,7 +121,7 @@ impl<E: Entity> DomainFactory for TypedFactory<E> {
     }
 }
 
-// ── DatabaseConfig — builder لكل DatabaseManager ──────────────────────────────
+// ── DatabaseConfig — builder for each DatabaseManager ──────────────────────────────
 
 pub struct DatabaseConfig {
     dir_path:        PathBuf,
@@ -177,7 +177,7 @@ impl DatabaseConfig {
         self
     }
 
-    /// سجّل Repository<E> تحت هذا الـ DatabaseManager
+    /// Register Repository<E> under this DatabaseManager
     pub fn register<E: Entity>(mut self, table: &'static str) -> Self {
         self.factories.push(Box::new(TypedFactory::<E> {
             table,
@@ -237,13 +237,13 @@ impl StorageBuilder {
         }
     }
 
-    /// event_handler مرة واحدة يغطي كل DatabaseManagers
+    /// event_handler initialized once to cover all DatabaseManagers
     pub fn event_handler<H: EventHandler>(self, handler: H) -> Self {
         self.emitter.event_handler(handler);
         self
     }
 
-    /// أضف DatabaseManager مع repositories الخاصة فيه
+    /// Add DatabaseManager with its repositories
     pub fn add_database(mut self, config: DatabaseConfig) -> Self {
         let mut config = config;
         if (config.dir_path.to_str().is_some() && config.dir_path.to_str().unwrap().is_empty()) || config.dir_path.to_str().is_none() {
@@ -261,13 +261,13 @@ impl StorageBuilder {
         let mut database_managers: HashMap<String, DatabaseManager> = HashMap::new();
 
         for config in self.database_configs {
-            // اجمع أسماء الجداول لهذا الـ DatabaseManager
+            // Collect table names for this DatabaseManager
             let tables: Vec<String> = config.factories
                 .iter()
                 .map(|f| f.table_name().to_string())
                 .collect();
 
-            // أنشئ DatabaseManager مستقل لكل config
+            // Create an independent DatabaseManager for each config
             let db_manager = DatabaseManager::new(
                 &config.dir_path,
                 config.backup_dir_path.as_ref(),
@@ -280,13 +280,13 @@ impl StorageBuilder {
                 config.cache_idle,
             ).await?;
 
-            // أنشئ Domain لكل factory تحت هذا الـ DatabaseManager
+            // Create a Domain for each factory under this DatabaseManager
             for factory in &config.factories {
                 let (type_id, domain) = factory.build(&db_manager, &self.emitter);
                 domains.insert(type_id, domain);
             }
 
-            // احتفظ بالـ DatabaseManager للـ maintenance
+            // Keep the DatabaseManager for maintenance
             database_managers.insert(config.db_name.clone(), db_manager);
         }
 
