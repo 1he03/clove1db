@@ -2,7 +2,7 @@
 name = "clove1db"
 version = "0.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["Hlever"]
 description="A lightweight embedded database framework for Rust — built on redb with layered cache, versioned backup, and domain-driven storage."
 
