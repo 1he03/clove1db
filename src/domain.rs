@@ -45,6 +45,34 @@ impl<E: Entity> Domain<E> {
         Ok(O::from_entity(entity))
     }
 
+    pub async fn update_bulk<I, O>(&self, inputs: Vec<(String, I)>) -> Result<(Vec<O>, String)>
+    where
+        I: InputDto<E>,
+        O: OutputDto<E>,
+    {
+        for (_, input) in &inputs {
+            input.validate()?;
+        }
+    
+        let mut results  = Vec::new();
+        let mut bulk_ids = Vec::new();
+    
+        for (id, input) in inputs {
+            let current_version = self.repository.current_version(&id).await.unwrap_or(0);
+            let entity = input.into_entity()?;
+            self.repository.set(&id, &entity).await?;
+            self.emitter.info(format!("bulk updated → {}", id));
+            bulk_ids.push((id, current_version));
+            results.push(O::from_entity(entity));
+        }
+    
+        let bulk_id = self.repository.set_bulk(bulk_ids).await?;
+        self.emitter.info(format!("bulk snapshot saved → {}", bulk_id));
+    
+        Ok((results, bulk_id))
+    }
+    
+
     pub async fn delete(&self, id: &str) -> Result<()> {
         self.repository.delete(id).await?;
         self.emitter.info(format!("deleted → {}", id));
@@ -60,6 +88,12 @@ impl<E: Entity> Domain<E> {
     pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
         self.repository.restore_at(id, timestamp).await?;
         self.emitter.info(format!("restored → {} at ts {}", id, timestamp));
+        Ok(())
+    }
+    
+    pub async fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
+        self.repository.restore_bulk(bulk_id).await?;
+        self.emitter.info(format!("bulk restored → {}", bulk_id));
         Ok(())
     }
 

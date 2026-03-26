@@ -1,11 +1,11 @@
 [package]
 name = "clove1db"
-version = "0.0.7"
+version = "0.0.14"
 edition = "2024"
 license = "MIT"
 authors = ["Hlever"]
 description="A lightweight embedded database framework for Rust — built on redb with layered cache, versioned backup, and domain-driven storage."
-repository = "https://github.com/1he03/clove1db"
+repository = "https://github.com/clove7/clove1db"
 keywords = ["database", "embedded", "storage", "cache", "backup"]
 categories = ["database", "caching", "data-structures"]
 readme = "README.md"
@@ -18,7 +18,7 @@ chrono = "0.4.44"
 dirs = "6.0.0"
 include_dir = "0.7.4"
 itertools = "0.14.0"
-moka = { version = "0.12.14", features = ["future"] }
+moka = { version = "0.12.15", features = ["future"] }
 rayon = "1.11.0"
 redb = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -26,3 +26,4 @@ serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full", "rt-multi-thread"] }
 walkdir = "2.5.0"
+uuid = { version = "1.22.0", features = ["v4"] } #

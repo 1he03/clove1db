@@ -252,20 +252,23 @@ impl DatabaseManager {
     
         match record.operation {
             // Set or Restore → Write data to Primary + Cache + Backup
-            BackupOperation::Set | BackupOperation::Restore => {
-                let data = record.data.clone().unwrap();
-    
-                // Primary DB
-                let write_txn = self.db.begin_write()?;
-                { write_txn.open_table(table)?.insert(key, data.as_slice())?; }
-                write_txn.commit()?;
-    
-                // Cache
-                let cache_key = format!("{}:{}", table_name, key);
-                self.memory_cache.insert(cache_key, data.clone()).await;
+            BackupOperation::Set | BackupOperation::Restore | BackupOperation::RestoreBulk => {
+                let data = record.data;
+
+                if data.is_some() {
+                    let data = data.clone().unwrap();
+                    // Primary DB
+                    let write_txn = self.db.begin_write()?;
+                    { write_txn.open_table(table)?.insert(key, data.as_slice())?; }
+                    write_txn.commit()?;
+        
+                    // Cache
+                    let cache_key = format!("{}:{}", table_name, key);
+                    self.memory_cache.insert(cache_key, data.clone()).await;
+                }
     
                 // Backup record_restore
-                bm.record_restore(table, table_name, key, version, Some(data))?;
+                bm.record_restore(table, table_name, key, version, data, record.bulk_id)?;
             }
     
             // Delete → Delete from Primary + Cache + log restore with None
@@ -277,7 +280,7 @@ impl DatabaseManager {
                 let cache_key = format!("{}:{}", table_name, key);
                 self.memory_cache.invalidate(&cache_key).await;
     
-                bm.record_restore(table, table_name, key, version, None)?;
+                bm.record_restore(table, table_name, key, version, None, None)?;
             }
         }
     
@@ -313,6 +316,64 @@ impl DatabaseManager {
         // Same logic as restore_by_version
         self.restore_by_version(table, table_name, key, target_version).await
     }
+
+    pub async fn set_bulk<'db>(
+        &self,
+        table_name: &str,
+        entries:    Vec<(String, u64)>
+    ) -> Result<String> {
+        let bm = self.backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+        bm.write_bulk(table_name, entries)
+    }
+    
+    pub async fn restore_bulk<'db>(
+        &self,
+        table:      TableDefinition<'db, &str, &[u8]>,
+        table_name: &str,
+        bulk_id:    &str,
+    ) -> Result<()> {
+        let bm = self.backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+    
+        let results = bm.restore_bulk(table, table_name, bulk_id)?;
+    
+        for (key, data) in results {
+            match data {
+                Some(d) => {
+                    let write_txn = self.db.begin_write()?;
+                    { write_txn.open_table(table)?.insert(key.as_str(), d.as_slice())?; }
+                    write_txn.commit()?;
+                    let cache_key = format!("{}:{}", table_name, key);
+                    self.memory_cache.insert(cache_key, d).await;
+                }
+                None => {
+                    let write_txn = self.db.begin_write()?;
+                    { write_txn.open_table(table)?.remove(key.as_str())?; }
+                    write_txn.commit()?;
+                    let cache_key = format!("{}:{}", table_name, key);
+                    self.memory_cache.invalidate(&cache_key).await;
+                }
+            }
+        }
+    
+        Ok(())
+    }
+
+    pub async fn current_version<'db>(
+        &self,
+        table_name: &str,
+        id:         &str,
+    ) -> Result<u64> {
+        let bm = self.backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+        Ok(bm.current_version(table_name, id)?)
+    }
+    
+    
 
     /// Get database reference (for repositories)
     pub fn db(&self) -> &Arc<Database> {
@@ -404,6 +465,10 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         Ok(())
     }
 
+    pub async fn set_bulk(&self, entries:    Vec<(String, u64)>) -> Result<String> {
+        self.database_manager.set_bulk(self.table, entries).await
+    }
+
     pub async fn delete(&self, id: &str) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
@@ -426,4 +491,15 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .await
     }
     
+    pub async fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        self.database_manager.restore_bulk(table, self.table, bulk_id).await
+    }
+    
+    pub async fn current_version(&self, id: &str) -> Result<u64> {
+        self.database_manager
+            .current_version(self.table, id)
+            .await
+    }
+
 }
