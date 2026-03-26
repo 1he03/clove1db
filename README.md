@@ -7,8 +7,9 @@ A lightweight embedded database framework for Rust — built on redb with layere
 - 🗄️ **Embedded Storage**: Built on [redb](https://github.com/cberner/redb) — no external server needed
 - ⚡ **Layered Cache**: In-memory cache via [moka](https://github.com/moka-rs/moka) with TTL and idle expiry
 - 🔁 **Versioned Backup**: Every write/delete is recorded — restore any entity to any previous version
+- 📦 **Bulk Operations**: Update and restore multiple entities at once with a single `bulk_id`
 - 🧩 **Domain-Driven**: Clean separation via `Entity`, `InputDto`, `OutputDto`, `Repository`, `Domain`
-- 📦 **Multi-Database**: Multiple isolated DB files in a single `Storage` instance
+- 🗂️ **Multi-Database**: Multiple isolated DB files in a single `Storage` instance
 - 📡 **Event System**: Built-in event emitter with `on_info`, `on_warn`, `on_error` hooks
 - 🦀 **Async**: Fully async via [tokio](https://tokio.rs)
 
@@ -16,7 +17,7 @@ A lightweight embedded database framework for Rust — built on redb with layere
 
 ```toml
 [dependencies]
-clove1db = "0.0.7"
+clove1db = "0.0.14"
 ```
 
 ## Quick Start
@@ -54,34 +55,62 @@ let storage = Storage::builder(StorageConfig::default())
 // 3. Use domain
 let domain = storage.domain::<User>();
 
-let user = domain.create::<CreateUserDto, UserResponse>(input).await?;
+let user  = domain.create::<CreateUserDto, UserResponse>(input).await?;
 let found = domain.get::<UserResponse>(&user.id).await?;
 let list  = domain.list::<UserResponse>().await?;
+domain.update::<CreateUserDto, UserResponse>(&user.id, input).await?;
 domain.delete(&user.id).await?;
 ```
 
 ## Backup & Versioning
 
 ```rust
-// Every write is recorded automatically
+// Every write/delete is recorded automatically
 domain.update::<CreateUserDto, UserResponse>(&id, input).await?;
 
-// View history
+// View full history
 let bm      = storage.db_manager("users_db").backup_manager.as_ref().unwrap();
 let history = bm.history(TableDefinition::new("users"), &id)?;
 
-// Restore to specific version
+// View data at a specific version (read-only)
+let data = bm.view_by_version(TableDefinition::new("users"), &id, 2)?;
+
+// View data at a point in time (read-only)
+let data = bm.view_at(TableDefinition::new("users"), &id, timestamp_ms)?;
+
+// Restore to a specific version (writes to DB + cache + backup)
 domain.restore_by_version(&id, 1).await?;
 
 // Restore to a point in time
 domain.restore_at(&id, timestamp_ms).await?;
 ```
 
+## Bulk Operations
+
+```rust
+// Update multiple entities at once — returns (results, bulk_id)
+let (updated, bulk_id) = domain.update_bulk::<CreateUserDto, UserResponse>(
+    vec![
+        (id1.clone(), CreateUserDto { name: "Alice".into() }),
+        (id2.clone(), CreateUserDto { name: "Bob".into()   }),
+    ]
+).await?;
+
+// Restore all entities to their state before the bulk update
+domain.restore_bulk(&bulk_id).await?;
+
+// List all saved bulk snapshots
+let snapshots = bm.list_bulk("users")?;
+for snap in snapshots {
+    println!("bulk_id: {} | {} entries | {}", snap.bulk_id, snap.entries.len(), snap.date);
+}
+```
+
 ## Multi-Database
 
 ```rust
 let storage = Storage::builder(StorageConfig::default())
-    // DB 1 — default path (next to exe)
+    // DB 1 — default path
     .add_database(
         DatabaseConfig::new("users_db", "users")
             .register::<User>("users")
