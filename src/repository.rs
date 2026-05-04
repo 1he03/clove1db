@@ -355,6 +355,31 @@ impl DatabaseManager {
         Ok(())
     }
 
+    pub async fn get_by_version<'db>(
+        &self,
+        table: TableDefinition<'db, &str, &[u8]>,
+        key: &str,
+        version: u64,
+    ) -> Result<BackupRecord> {
+        let backup_key = format!("{}:{}", key, version);
+        let read_txn = self
+            .backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::OptionNone)?
+            .db
+            .begin_read()?;
+        let tbl = read_txn.open_table(table)?;
+
+        let record = tbl
+            .get(backup_key.as_str())?
+            .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+            .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)));
+
+        drop(read_txn);
+
+        record
+    }
+
     pub async fn restore_at<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
@@ -380,6 +405,25 @@ impl DatabaseManager {
         // Same logic as restore_by_version
         self.restore_by_version(table, table_name, key, target_version)
             .await
+    }
+
+    pub async fn get_version_by_at<'db>(
+        &self,
+        table: TableDefinition<'db, &str, &[u8]>,
+        key: &str,
+        timestamp: i64,
+    ) -> Result<BackupRecord> {
+        let bm = self
+            .backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+
+        // Search for the last record before the timestamp
+        bm.history(table, key)?
+            .into_iter()
+            .filter(|r| r.timestamp <= timestamp)
+            .last()
+            .ok_or_else(|| ClError::NotFound("no record at this timestamp".into()))
     }
 
     pub async fn set_bulk<'db>(
@@ -451,7 +495,20 @@ impl DatabaseManager {
             .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
-        Ok(bm.current_version(table_name, id)?)
+        bm.current_version(table_name, id)
+    }
+
+    pub async fn history<'db>(
+        &self,
+        table: TableDefinition<'db, &str, &[u8]>,
+        key: &str,
+    ) -> Result<Vec<BackupRecord>> {
+        let bm = self
+            .backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+
+        bm.history(table, key)
     }
 
     /// Get database reference (for repositories)
@@ -574,6 +631,68 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .await
     }
 
+    pub async fn get_by_version(
+        &self,
+        id: &str,
+        version: u64,
+    ) -> Result<BackupRecordRepository<T>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let record = self
+            .database_manager
+            .get_by_version(table, id, version)
+            .await?;
+
+        let data = if let Some(data) = record.data {
+            let value = serde_json::from_slice(&data)?;
+            Some(value)
+        } else {
+            None
+        };
+
+        Ok(BackupRecordRepository::<T> {
+            version: record.version,
+            timestamp: record.timestamp,
+            date: record.date,
+            operation: record.operation,
+            table: record.table,
+            key: record.key,
+            data: data,
+            restored_version: record.restored_version,
+            bulk_id: record.bulk_id,
+        })
+    }
+
+    pub async fn get_version_by_at(
+        &self,
+        id: &str,
+        timestamp: i64,
+    ) -> Result<BackupRecordRepository<T>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let record = self
+            .database_manager
+            .get_version_by_at(table, id, timestamp)
+            .await?;
+
+        let data = if let Some(data) = record.data {
+            let value = serde_json::from_slice(&data)?;
+            Some(value)
+        } else {
+            None
+        };
+
+        Ok(BackupRecordRepository::<T> {
+            version: record.version,
+            timestamp: record.timestamp,
+            date: record.date,
+            operation: record.operation,
+            table: record.table,
+            key: record.key,
+            data: data,
+            restored_version: record.restored_version,
+            bulk_id: record.bulk_id,
+        })
+    }
+
     pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
@@ -588,7 +707,52 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .await
     }
 
+    pub async fn history(&self, id: &str) -> Result<Vec<BackupRecordRepository<T>>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let history = self
+            .database_manager
+            .history(table, id)
+            .await?
+            .into_iter()
+            .map(|record| {
+                let data = if let Some(data) = record.data {
+                    let value = serde_json::from_slice(&data).unwrap();
+                    Some(value)
+                } else {
+                    None
+                };
+
+                BackupRecordRepository::<T> {
+                    version: record.version,
+                    timestamp: record.timestamp,
+                    date: record.date,
+                    operation: record.operation,
+                    table: record.table,
+                    key: record.key,
+                    data: data,
+                    restored_version: record.restored_version,
+                    bulk_id: record.bulk_id,
+                }
+            })
+            .collect_vec();
+
+        Ok(history)
+    }
+
     pub async fn current_version(&self, id: &str) -> Result<u64> {
         self.database_manager.current_version(self.table, id).await
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackupRecordRepository<T> {
+    pub version: u64,
+    pub timestamp: i64,
+    pub date: String,
+    pub operation: BackupOperation,
+    pub table: String,
+    pub key: String,
+    pub data: Option<T>,
+    pub bulk_id: Option<String>,
+    pub restored_version: Option<u64>,
 }
