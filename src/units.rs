@@ -1,3 +1,4 @@
+use redb::{SetDurabilityError, StorageError};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -34,6 +35,12 @@ pub enum ClError {
 
     #[error("Cache error: {0}")]
     Cache(String),
+
+    #[error("UTF-8 error: {0}")]
+    Utf8Error(String),
+
+    #[error("Option None error")]
+    OptionNone,
 }
 
 impl From<std::io::Error> for ClError {
@@ -60,8 +67,8 @@ impl From<redb::TableError> for ClError {
     }
 }
 
-impl From<redb::StorageError> for ClError {
-    fn from(e: redb::StorageError) -> Self {
+impl From<StorageError> for ClError {
+    fn from(e: StorageError) -> Self {
         ClError::Database(redb::Error::from(e))
     }
 }
@@ -72,10 +79,28 @@ impl From<redb::CommitError> for ClError {
     }
 }
 
-// impl From<std::io::Error> for ClError {
-//     fn from(e: std::io::Error) -> Self {
-//         ClError::IoError(e.to_string())
-//     }
-// }
+impl From<SetDurabilityError> for ClError {
+    fn from(e: SetDurabilityError) -> Self {
+        ClError::Database(redb::Error::from(e))
+    }
+}
+
+impl From<std::str::Utf8Error> for ClError {
+    fn from(e: std::str::Utf8Error) -> Self {
+        ClError::Utf8Error(e.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for ClError {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        ClError::Utf8Error(e.to_string())
+    }
+}
+
+impl From<std::string::String> for ClError {
+    fn from(e: std::string::String) -> Self {
+        ClError::Utf8Error(e)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, ClError>;

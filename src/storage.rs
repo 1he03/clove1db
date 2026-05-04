@@ -7,25 +7,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    repository::DatabaseManager,
-    domain::Domain,
-    entity::Entity,
-    event_emitter::EventEmitter,
-    event_handler::EventHandler,
-    repository::Repository,
-    units::Result,
+    domain::Domain, entity::Entity, event_emitter::EventEmitter, event_handler::EventHandler,
+    repository::DatabaseManager, repository::Repository, units::Result,
 };
 
 const DEFAULT_CACHE_CAPACITY: u64 = 10_000;
-const DEFAULT_CACHE_TTL: u64      = 300;
-const DEFAULT_CACHE_IDLE: u64     = 60;
+const DEFAULT_CACHE_TTL: u64 = 300;
+const DEFAULT_CACHE_IDLE: u64 = 60;
 const LOG_CHANNEL_CAPACITY: usize = 1024;
 
 // ── Inner ──────────────────────────────────────────────────────────────────────
 
 struct StorageInner {
-    emitter:          Arc<EventEmitter>,
-    domains:          HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    emitter: Arc<EventEmitter>,
+    domains: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     // We keep them for maintenance (backup update, etc.)
     database_managers: HashMap<String, DatabaseManager>,
 }
@@ -46,10 +41,12 @@ impl Storage {
             .domains
             .get(&TypeId::of::<E>())
             .and_then(|b| b.downcast_ref::<Domain<E>>())
-            .unwrap_or_else(|| panic!(
-                "[Storage] Domain<{}> not registered",
-                std::any::type_name::<E>()
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "[Storage] Domain<{}> not registered",
+                    std::any::type_name::<E>()
+                )
+            })
     }
 
     /// Access a specific DatabaseManager by name
@@ -57,17 +54,11 @@ impl Storage {
         self.0
             .database_managers
             .get(name)
-            .unwrap_or_else(|| panic!(
-                "[Storage] DatabaseManager '{}' not found",
-                name
-            ))
+            .unwrap_or_else(|| panic!("[Storage] DatabaseManager '{}' not found", name))
     }
 
     pub fn db_list(&self) -> Vec<&DatabaseManager> {
-        self.0
-            .database_managers
-            .values()
-            .collect()
+        self.0.database_managers.values().collect()
     }
 
     pub fn db_list_names(&self) -> Vec<String> {
@@ -114,8 +105,8 @@ impl<E: Entity> DomainFactory for TypedFactory<E> {
         database_manager: &DatabaseManager,
         emitter: &EventEmitter,
     ) -> (TypeId, Box<dyn Any + Send + Sync>) {
-        let repo   = Repository::<E>::new(self.table, database_manager.clone());
-        let child  = emitter.child(self.table);
+        let repo = Repository::<E>::new(self.table, database_manager.clone());
+        let child = emitter.child(self.table);
         let domain = Domain::new(repo, child);
         (TypeId::of::<E>(), Box::new(domain))
     }
@@ -124,34 +115,37 @@ impl<E: Entity> DomainFactory for TypedFactory<E> {
 // ── DatabaseConfig — builder for each DatabaseManager ──────────────────────────────
 
 pub struct DatabaseConfig {
-    dir_path:        PathBuf,
+    has_cache: bool,
+    dir_path: PathBuf,
     backup_dir_path: Option<PathBuf>,
-    dir_name:        String,
-    db_name:         String,
-    cache_capacity:  u64,
-    cache_ttl:       u64,
-    cache_idle:      u64,
-    factories:       Vec<Box<dyn DomainFactory>>,
-    backup_enabled:  bool,
+    dir_name: String,
+    db_name: String,
+    cache_capacity: u64,
+    cache_ttl: u64,
+    cache_idle: u64,
+    factories: Vec<Box<dyn DomainFactory>>,
+    backup_enabled: bool,
 }
 
 impl DatabaseConfig {
-    pub fn new(
-        dir_name: &str,
-        db_name: &str,
-    ) -> Self {
-
+    pub fn new(dir_name: &str, db_name: &str) -> Self {
         Self {
+            has_cache: true,
             dir_path: PathBuf::from(""),
             backup_dir_path: None,
-            dir_name:   dir_name.to_string(),
-            db_name:    db_name.to_string(),
+            dir_name: dir_name.to_string(),
+            db_name: db_name.to_string(),
             cache_capacity: DEFAULT_CACHE_CAPACITY,
-            cache_ttl:      DEFAULT_CACHE_TTL,
-            cache_idle:     DEFAULT_CACHE_IDLE,
-            factories:  Vec::new(),
+            cache_ttl: DEFAULT_CACHE_TTL,
+            cache_idle: DEFAULT_CACHE_IDLE,
+            factories: Vec::new(),
             backup_enabled: false,
         }
+    }
+
+    pub fn has_cache(mut self, has_cache: bool) -> Self {
+        self.has_cache = has_cache;
+        self
     }
 
     pub fn dir_path(mut self, path: PathBuf) -> Self {
@@ -172,8 +166,9 @@ impl DatabaseConfig {
 
     pub fn cache(mut self, capacity: u64, ttl_secs: u64, idle_secs: u64) -> Self {
         self.cache_capacity = capacity;
-        self.cache_ttl      = ttl_secs;
-        self.cache_idle     = idle_secs;
+        self.cache_ttl = ttl_secs;
+        self.cache_idle = idle_secs;
+        self.has_cache = true;
         self
     }
 
@@ -201,7 +196,11 @@ impl StorageConfig {
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        Self { log_channel_capacity: LOG_CHANNEL_CAPACITY, name: "storage".to_string(), dir_path }
+        Self {
+            log_channel_capacity: LOG_CHANNEL_CAPACITY,
+            name: "storage".to_string(),
+            dir_path,
+        }
     }
 
     pub fn change_log_channel_capacity(mut self, capacity: usize) -> Self {
@@ -231,7 +230,10 @@ pub struct StorageBuilder {
 impl StorageBuilder {
     fn new(config: StorageConfig) -> Self {
         Self {
-            emitter: Arc::new(EventEmitter::new(config.name.clone(), config.log_channel_capacity)),
+            emitter: Arc::new(EventEmitter::new(
+                config.name.clone(),
+                config.log_channel_capacity,
+            )),
             database_configs: Vec::new(),
             storage_config: config,
         }
@@ -246,7 +248,9 @@ impl StorageBuilder {
     /// Add DatabaseManager with its repositories
     pub fn add_database(mut self, config: DatabaseConfig) -> Self {
         let mut config = config;
-        if (config.dir_path.to_str().is_some() && config.dir_path.to_str().unwrap().is_empty()) || config.dir_path.to_str().is_none() {
+        if (config.dir_path.to_str().is_some() && config.dir_path.to_str().unwrap().is_empty())
+            || config.dir_path.to_str().is_none()
+        {
             config.dir_path = self.storage_config.dir_path.clone();
         }
         if config.backup_enabled && config.backup_dir_path.is_none() {
@@ -262,7 +266,8 @@ impl StorageBuilder {
 
         for config in self.database_configs {
             // Collect table names for this DatabaseManager
-            let tables: Vec<String> = config.factories
+            let tables: Vec<String> = config
+                .factories
                 .iter()
                 .map(|f| f.table_name().to_string())
                 .collect();
@@ -278,7 +283,9 @@ impl StorageBuilder {
                 config.cache_capacity,
                 config.cache_ttl,
                 config.cache_idle,
-            ).await?;
+                config.has_cache,
+            )
+            .await?;
 
             // Create a Domain for each factory under this DatabaseManager
             for factory in &config.factories {

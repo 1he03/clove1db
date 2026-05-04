@@ -1,17 +1,21 @@
 // use crate::emitter::LogEventEmitter;
-use crate::{backup::{BackupManager, BackupOperation, BackupRecord}, event_emitter::EventEmitter, units::{ClError, Result}};
+use crate::{
+    backup::{BackupManager, BackupOperation, BackupRecord},
+    event_emitter::EventEmitter,
+    units::{ClError, Result},
+};
 // use crate::units::{CACHE_IDLE_SECONDS, CACHE_MAX_CAPACITY, CACHE_TTL_SECONDS};
 use chrono::{Datelike, Local};
 use itertools::Itertools;
 use moka::future::Cache;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 // use std::env;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseManager {
@@ -22,7 +26,7 @@ pub struct DatabaseManager {
     pub db: Arc<Database>,
 
     // L3: Backup manager (backup.rs) (optional)
-    pub backup_manager: Option<BackupManager>, 
+    pub backup_manager: Option<BackupManager>,
 
     // Date
     pub date: Date,
@@ -36,11 +40,26 @@ pub struct DatabaseManager {
     // Tables names
     pub tables_names: Vec<String>,
 
+    // Emitter
     emitter: Arc<EventEmitter>,
+
+    // Has cache
+    has_cache: bool,
 }
 
 impl DatabaseManager {
-    pub async fn new(dir_path: &PathBuf, backup_dir_path: Option<&PathBuf>, dir_name: &str, db_name: &str, tables: Vec<String>, emitter: &Arc<EventEmitter>, cache_max_capacity: u64, cache_ttl_seconds: u64, cache_idle_seconds: u64) -> Result<Self> {
+    pub async fn new(
+        dir_path: &PathBuf,
+        backup_dir_path: Option<&PathBuf>,
+        dir_name: &str,
+        db_name: &str,
+        tables: Vec<String>,
+        emitter: &Arc<EventEmitter>,
+        cache_max_capacity: u64,
+        cache_ttl_seconds: u64,
+        cache_idle_seconds: u64,
+        has_cache: bool,
+    ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
             Some(backup_dir_path.join(dir_name))
@@ -57,10 +76,13 @@ impl DatabaseManager {
             None
         };
 
-        let db = Arc::new(Database::create(db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?);
+        let db = Arc::new(
+            Database::create(db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?,
+        );
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
-            let backup_manager = BackupManager::new(&backup_db_path, emitter.child("backup"));
+            let backup_manager =
+                BackupManager::new(&backup_db_path, emitter.child("backup"), has_cache);
             if backup_manager.is_ok() {
                 Some(backup_manager.unwrap())
             } else {
@@ -74,7 +96,8 @@ impl DatabaseManager {
         {
             for table in &tables {
                 {
-                    let table_definition: TableDefinition<&str, &[u8]> = TableDefinition::new(table);
+                    let table_definition: TableDefinition<&str, &[u8]> =
+                        TableDefinition::new(table);
                     write_txn.open_table(table_definition)?;
                 }
 
@@ -106,7 +129,8 @@ impl DatabaseManager {
             dir: dir_local,
             db_name: db_name.to_string(),
             tables_names: tables,
-            emitter: emitter.clone()
+            emitter: emitter.clone(),
+            has_cache,
         })
     }
 
@@ -118,17 +142,29 @@ impl DatabaseManager {
         key: &str,
         value: Vec<u8>,
     ) -> Result<()> {
-        // Step 1: Write to database (L2)
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table_ref = write_txn.open_table(table)?;
-            table_ref.insert(key, value.as_slice())?;
-        }
-        write_txn.commit()?;
+        if self.has_cache {
+            // Write to database (L2)
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table_ref = write_txn.open_table(table)?;
+                table_ref.insert(key, value.as_slice())?;
+            }
+            write_txn.commit()?;
 
-        // Step 2: Write to cache (L1) - only after DB success
-        let cache_key = format!("{}:{}", table_name, key);
-        self.memory_cache.insert(cache_key, value.clone()).await;
+            // Write to cache (L1) - only after DB success
+            let cache_key = format!("{}:{}", table_name, key);
+            self.memory_cache.insert(cache_key, value.clone()).await;
+        } else {
+            // Write to database (L2)
+            let mut write_txn = self.db.begin_write()?;
+            write_txn.set_durability(Durability::Immediate)?;
+            {
+                let mut table_ref = write_txn.open_table(table)?;
+                let mut slot = table_ref.insert_reserve(key, value.len())?;
+                slot.as_mut().copy_from_slice(&value);
+            }
+            write_txn.commit()?;
+        }
 
         if let Some(ref bm) = self.backup_manager {
             // Step 3: Record write to backup (L3)
@@ -148,7 +184,9 @@ impl DatabaseManager {
         let cache_key = format!("{}:{}", table_name, key);
 
         // Step 1: Check memory cache first (L1)
-        if let Some(value) = self.memory_cache.get(&cache_key).await {
+        if self.has_cache
+            && let Some(value) = self.memory_cache.get(&cache_key).await
+        {
             return Ok(Some(value));
         }
 
@@ -161,7 +199,9 @@ impl DatabaseManager {
                 let data: Vec<u8> = value.value().to_vec();
 
                 // Step 3: Update cache for next time
-                self.memory_cache.insert(cache_key, data.clone()).await;
+                if self.has_cache {
+                    self.memory_cache.insert(cache_key, data.clone()).await;
+                }
 
                 Ok(Some(data))
             }
@@ -215,7 +255,9 @@ impl DatabaseManager {
         }
 
         // Step 2: Delete from cache (L1)
-        self.memory_cache.invalidate(&cache_key).await;
+        if self.has_cache {
+            self.memory_cache.invalidate(&cache_key).await;
+        }
 
         if found {
             if let Some(ref bm) = self.backup_manager {
@@ -229,80 +271,102 @@ impl DatabaseManager {
 
     pub async fn restore_by_version<'db>(
         &self,
-        table:      TableDefinition<'db, &str, &[u8]>,
+        table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
-        key:        &str,
-        version:    u64,
+        key: &str,
+        version: u64,
     ) -> Result<()> {
-        let bm = self.backup_manager
+        let bm = self
+            .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
-    
+
         // Read the specified record directly
         let backup_key = format!("{}:{}", key, version);
-        let read_txn   = self.backup_manager.as_ref().unwrap().db.begin_read()?;
-        let tbl        = read_txn.open_table(table)?;
-    
+        let read_txn = self
+            .backup_manager
+            .as_ref()
+            .ok_or_else(|| ClError::OptionNone)?
+            .db
+            .begin_read()?;
+        let tbl = read_txn.open_table(table)?;
+
         let record = tbl
             .get(backup_key.as_str())?
             .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
             .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)))?;
-    
+
         drop(read_txn);
-    
+
         match record.operation {
             // Set or Restore → Write data to Primary + Cache + Backup
             BackupOperation::Set | BackupOperation::Restore | BackupOperation::RestoreBulk => {
                 let data = record.data;
 
                 if data.is_some() {
-                    let data = data.clone().unwrap();
+                    let data = data.clone().ok_or_else(|| ClError::OptionNone)?;
                     // Primary DB
-                    let write_txn = self.db.begin_write()?;
-                    { write_txn.open_table(table)?.insert(key, data.as_slice())?; }
+                    let mut write_txn = self.db.begin_write()?;
+                    if self.has_cache {
+                        write_txn.open_table(table)?.insert(key, data.as_slice())?;
+                    } else {
+                        write_txn.set_durability(Durability::Immediate)?;
+                        {
+                            let mut table_ref = write_txn.open_table(table)?;
+                            let mut slot = table_ref.insert_reserve(key, data.len())?;
+                            slot.as_mut().copy_from_slice(&data);
+                        }
+                    }
                     write_txn.commit()?;
-        
+
                     // Cache
-                    let cache_key = format!("{}:{}", table_name, key);
-                    self.memory_cache.insert(cache_key, data.clone()).await;
+                    if self.has_cache {
+                        let cache_key = format!("{}:{}", table_name, key);
+                        self.memory_cache.insert(cache_key, data.clone()).await;
+                    }
                 }
-    
+
                 // Backup record_restore
                 bm.record_restore(table, table_name, key, version, data, record.bulk_id)?;
             }
-    
+
             // Delete → Delete from Primary + Cache + log restore with None
             BackupOperation::Delete => {
                 let write_txn = self.db.begin_write()?;
-                { write_txn.open_table(table)?.remove(key)?; }
+                {
+                    write_txn.open_table(table)?.remove(key)?;
+                }
                 write_txn.commit()?;
-    
-                let cache_key = format!("{}:{}", table_name, key);
-                self.memory_cache.invalidate(&cache_key).await;
-    
+
+                if self.has_cache {
+                    let cache_key = format!("{}:{}", table_name, key);
+                    self.memory_cache.invalidate(&cache_key).await;
+                }
+
                 bm.record_restore(table, table_name, key, version, None, None)?;
             }
         }
-    
+
         self.emitter.info(format!(
             "restored → {}:{} from v{}",
             table_name, key, version
         ));
-    
+
         Ok(())
     }
-    
+
     pub async fn restore_at<'db>(
         &self,
-        table:      TableDefinition<'db, &str, &[u8]>,
+        table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
-        key:        &str,
-        timestamp:  i64,
+        key: &str,
+        timestamp: i64,
     ) -> Result<()> {
-        let bm = self.backup_manager
+        let bm = self
+            .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
-    
+
         // Search for the last record before the timestamp
         let record = bm
             .history(table, key)?
@@ -310,70 +374,85 @@ impl DatabaseManager {
             .filter(|r| r.timestamp <= timestamp)
             .last()
             .ok_or_else(|| ClError::NotFound("no record at this timestamp".into()))?;
-    
+
         let target_version = record.version;
-    
+
         // Same logic as restore_by_version
-        self.restore_by_version(table, table_name, key, target_version).await
+        self.restore_by_version(table, table_name, key, target_version)
+            .await
     }
 
     pub async fn set_bulk<'db>(
         &self,
         table_name: &str,
-        entries:    Vec<(String, u64)>
+        entries: Vec<(String, u64)>,
     ) -> Result<String> {
-        let bm = self.backup_manager
+        let bm = self
+            .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
         bm.write_bulk(table_name, entries)
     }
-    
+
     pub async fn restore_bulk<'db>(
         &self,
-        table:      TableDefinition<'db, &str, &[u8]>,
+        table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
-        bulk_id:    &str,
+        bulk_id: &str,
     ) -> Result<()> {
-        let bm = self.backup_manager
+        let bm = self
+            .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
-    
+
         let results = bm.restore_bulk(table, table_name, bulk_id)?;
-    
+
         for (key, data) in results {
             match data {
                 Some(d) => {
-                    let write_txn = self.db.begin_write()?;
-                    { write_txn.open_table(table)?.insert(key.as_str(), d.as_slice())?; }
+                    let mut write_txn = self.db.begin_write()?;
+                    if self.has_cache {
+                        write_txn
+                            .open_table(table)?
+                            .insert(key.as_str(), d.as_slice())?;
+                    } else {
+                        write_txn.set_durability(Durability::Immediate)?;
+                        {
+                            let mut table_ref = write_txn.open_table(table)?;
+                            let mut slot = table_ref.insert_reserve(key.as_str(), d.len())?;
+                            slot.as_mut().copy_from_slice(&d);
+                        }
+                    }
                     write_txn.commit()?;
-                    let cache_key = format!("{}:{}", table_name, key);
-                    self.memory_cache.insert(cache_key, d).await;
+                    if self.has_cache {
+                        let cache_key = format!("{}:{}", table_name, key);
+                        self.memory_cache.insert(cache_key, d).await;
+                    }
                 }
                 None => {
                     let write_txn = self.db.begin_write()?;
-                    { write_txn.open_table(table)?.remove(key.as_str())?; }
+                    {
+                        write_txn.open_table(table)?.remove(key.as_str())?;
+                    }
                     write_txn.commit()?;
-                    let cache_key = format!("{}:{}", table_name, key);
-                    self.memory_cache.invalidate(&cache_key).await;
+                    if self.has_cache {
+                        let cache_key = format!("{}:{}", table_name, key);
+                        self.memory_cache.invalidate(&cache_key).await;
+                    }
                 }
             }
         }
-    
+
         Ok(())
     }
 
-    pub async fn current_version<'db>(
-        &self,
-        table_name: &str,
-        id:         &str,
-    ) -> Result<u64> {
-        let bm = self.backup_manager
+    pub async fn current_version<'db>(&self, table_name: &str, id: &str) -> Result<u64> {
+        let bm = self
+            .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
         Ok(bm.current_version(table_name, id)?)
     }
-    
-    
 
     /// Get database reference (for repositories)
     pub fn db(&self) -> &Arc<Database> {
@@ -395,10 +474,20 @@ pub struct Dir {
 }
 
 impl Dir {
-    pub async fn new(dir: &PathBuf, backup_dir: Option<&PathBuf>, emitter: &Arc<EventEmitter>) -> Result<Self> {
+    pub async fn new(
+        dir: &PathBuf,
+        backup_dir: Option<&PathBuf>,
+        emitter: &Arc<EventEmitter>,
+    ) -> Result<Self> {
         if !dir.exists() {
             fs::create_dir_all(&dir).await?;
-            emitter.info(format!("✅ {} initialized", dir.to_str().unwrap()).as_str());
+            emitter.info(
+                format!(
+                    "✅ {} initialized",
+                    dir.to_str().ok_or_else(|| ClError::OptionNone)?
+                )
+                .as_str(),
+            );
         }
 
         let backup_dir_set = if let Some(backup) = backup_dir {
@@ -417,7 +506,6 @@ impl Dir {
         })
     }
 }
-
 
 #[derive(Clone)]
 pub struct Repository<T: DeserializeOwned + Serialize + Clone + 'static> {
@@ -452,7 +540,11 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
 
         Ok(data
             .iter()
-            .map(|data| serde_json::from_slice::<T>(&data).unwrap())
+            .map(|data| {
+                serde_json::from_slice::<T>(&data)
+                    .map_err(|e| ClError::Serialization(e))
+                    .unwrap()
+            })
             .collect_vec())
     }
 
@@ -465,15 +557,13 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         Ok(())
     }
 
-    pub async fn set_bulk(&self, entries:    Vec<(String, u64)>) -> Result<String> {
+    pub async fn set_bulk(&self, entries: Vec<(String, u64)>) -> Result<String> {
         self.database_manager.set_bulk(self.table, entries).await
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        self.database_manager
-            .delete(table, self.table, id)
-            .await?;
+        self.database_manager.delete(table, self.table, id).await?;
         Ok(())
     }
 
@@ -483,23 +573,22 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .restore_by_version(table, self.table, id, version)
             .await
     }
-    
+
     pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
             .restore_at(table, self.table, id, timestamp)
             .await
     }
-    
+
     pub async fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        self.database_manager.restore_bulk(table, self.table, bulk_id).await
-    }
-    
-    pub async fn current_version(&self, id: &str) -> Result<u64> {
         self.database_manager
-            .current_version(self.table, id)
+            .restore_bulk(table, self.table, bulk_id)
             .await
     }
 
+    pub async fn current_version(&self, id: &str) -> Result<u64> {
+        self.database_manager.current_version(self.table, id).await
+    }
 }
