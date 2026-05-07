@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    domain::Domain, entity::Entity, event_emitter::EventEmitter, event_handler::EventHandler,
-    repository::DatabaseManager, repository::Repository, units::Result,
+    domain::Domain, entity::Entity, repository::DatabaseManager, repository::Repository,
+    units::Result,
 };
 
 const DEFAULT_CACHE_CAPACITY: u64 = 10_000;
@@ -19,7 +19,6 @@ const LOG_CHANNEL_CAPACITY: usize = 1024;
 // ── Inner ──────────────────────────────────────────────────────────────────────
 
 struct StorageInner {
-    emitter: Arc<EventEmitter>,
     domains: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     // We keep them for maintenance (backup update, etc.)
     database_managers: HashMap<String, DatabaseManager>,
@@ -68,26 +67,13 @@ impl Storage {
             .map(|k| k.to_string())
             .collect()
     }
-
-    pub fn event_handler<H: EventHandler>(&self, handler: H) -> &Self {
-        self.0.emitter.event_handler(handler);
-        self
-    }
-
-    pub fn emitter(&self) -> &EventEmitter {
-        &self.0.emitter
-    }
 }
 
 // ── DomainFactory ──────────────────────────────────────────────────────────────
 
 trait DomainFactory: Send + Sync {
     fn table_name(&self) -> &'static str;
-    fn build(
-        &self,
-        database_manager: &DatabaseManager,
-        emitter: &EventEmitter,
-    ) -> (TypeId, Box<dyn Any + Send + Sync>);
+    fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>);
 }
 
 struct TypedFactory<E: Entity> {
@@ -100,14 +86,9 @@ impl<E: Entity> DomainFactory for TypedFactory<E> {
         self.table
     }
 
-    fn build(
-        &self,
-        database_manager: &DatabaseManager,
-        emitter: &EventEmitter,
-    ) -> (TypeId, Box<dyn Any + Send + Sync>) {
+    fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>) {
         let repo = Repository::<E>::new(self.table, database_manager.clone());
-        let child = emitter.child(self.table);
-        let domain = Domain::new(repo, child);
+        let domain = Domain::new(repo);
         (TypeId::of::<E>(), Box::new(domain))
     }
 }
@@ -222,7 +203,6 @@ impl StorageConfig {
 // ── StorageBuilder ─────────────────────────────────────────────────────────────
 
 pub struct StorageBuilder {
-    emitter: Arc<EventEmitter>,
     database_configs: Vec<DatabaseConfig>,
     storage_config: StorageConfig,
 }
@@ -230,19 +210,9 @@ pub struct StorageBuilder {
 impl StorageBuilder {
     fn new(config: StorageConfig) -> Self {
         Self {
-            emitter: Arc::new(EventEmitter::new(
-                config.name.clone(),
-                config.log_channel_capacity,
-            )),
             database_configs: Vec::new(),
             storage_config: config,
         }
-    }
-
-    /// event_handler initialized once to cover all DatabaseManagers
-    pub fn event_handler<H: EventHandler>(self, handler: H) -> Self {
-        self.emitter.event_handler(handler);
-        self
     }
 
     /// Add DatabaseManager with its repositories
@@ -260,7 +230,7 @@ impl StorageBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Storage> {
+    pub fn build(self) -> Result<Storage> {
         let mut domains: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
         let mut database_managers: HashMap<String, DatabaseManager> = HashMap::new();
 
@@ -279,17 +249,15 @@ impl StorageBuilder {
                 &config.dir_name,
                 &config.db_name,
                 tables,
-                &self.emitter,
                 config.cache_capacity,
                 config.cache_ttl,
                 config.cache_idle,
                 config.has_cache,
-            )
-            .await?;
+            )?;
 
             // Create a Domain for each factory under this DatabaseManager
             for factory in &config.factories {
-                let (type_id, domain) = factory.build(&db_manager, &self.emitter);
+                let (type_id, domain) = factory.build(&db_manager);
                 domains.insert(type_id, domain);
             }
 
@@ -297,14 +265,7 @@ impl StorageBuilder {
             database_managers.insert(config.db_name.clone(), db_manager);
         }
 
-        self.emitter.info(format!(
-            "✅ Storage ready — {} db(s) | {} domain(s)",
-            database_managers.len(),
-            domains.len()
-        ));
-
         Ok(Storage(Arc::new(StorageInner {
-            emitter: self.emitter,
             domains,
             database_managers,
         })))

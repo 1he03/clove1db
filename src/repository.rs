@@ -1,21 +1,20 @@
 // use crate::emitter::LogEventEmitter;
 use crate::{
     backup::{BackupManager, BackupOperation, BackupRecord},
-    event_emitter::EventEmitter,
     units::{ClError, Result},
 };
 // use crate::units::{CACHE_IDLE_SECONDS, CACHE_MAX_CAPACITY, CACHE_TTL_SECONDS};
 use chrono::{Datelike, Local};
 use itertools::Itertools;
-use moka::future::Cache;
+use moka::sync::Cache;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 // use std::env;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseManager {
@@ -40,21 +39,17 @@ pub struct DatabaseManager {
     // Tables names
     pub tables_names: Vec<String>,
 
-    // Emitter
-    emitter: Arc<EventEmitter>,
-
     // Has cache
     has_cache: bool,
 }
 
 impl DatabaseManager {
-    pub async fn new(
+    pub fn new(
         dir_path: &PathBuf,
         backup_dir_path: Option<&PathBuf>,
         dir_name: &str,
         db_name: &str,
         tables: Vec<String>,
-        emitter: &Arc<EventEmitter>,
         cache_max_capacity: u64,
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
@@ -67,7 +62,7 @@ impl DatabaseManager {
             None
         };
 
-        let dir_local = Arc::new(Dir::new(&dir, backup_dir.as_ref(), emitter).await?);
+        let dir_local = Arc::new(Dir::new(&dir, backup_dir.as_ref())?);
 
         let db_path = dir_local.dir.join(format!("{}.cldb", db_name));
         let backup_db_path = if let Some(backup_dir) = &dir_local.backup_dir {
@@ -81,8 +76,7 @@ impl DatabaseManager {
         );
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
-            let backup_manager =
-                BackupManager::new(&backup_db_path, emitter.child("backup"), has_cache);
+            let backup_manager = BackupManager::new(&backup_db_path, has_cache);
             if backup_manager.is_ok() {
                 Some(backup_manager.unwrap())
             } else {
@@ -129,13 +123,12 @@ impl DatabaseManager {
             dir: dir_local,
             db_name: db_name.to_string(),
             tables_names: tables,
-            emitter: emitter.clone(),
             has_cache,
         })
     }
 
     /// Write-Through: Write to both cache and DB
-    pub async fn set<'db>(
+    pub fn set<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -153,7 +146,7 @@ impl DatabaseManager {
 
             // Write to cache (L1) - only after DB success
             let cache_key = format!("{}:{}", table_name, key);
-            self.memory_cache.insert(cache_key, value.clone()).await;
+            self.memory_cache.insert(cache_key, value.clone());
         } else {
             // Write to database (L2)
             let mut write_txn = self.db.begin_write()?;
@@ -175,7 +168,7 @@ impl DatabaseManager {
     }
 
     /// Read with Cache-Aside pattern
-    pub async fn get<'db>(
+    pub fn get<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -185,7 +178,7 @@ impl DatabaseManager {
 
         // Step 1: Check memory cache first (L1)
         if self.has_cache
-            && let Some(value) = self.memory_cache.get(&cache_key).await
+            && let Some(value) = self.memory_cache.get(&cache_key)
         {
             return Ok(Some(value));
         }
@@ -200,7 +193,7 @@ impl DatabaseManager {
 
                 // Step 3: Update cache for next time
                 if self.has_cache {
-                    self.memory_cache.insert(cache_key, data.clone()).await;
+                    self.memory_cache.insert(cache_key, data.clone());
                 }
 
                 Ok(Some(data))
@@ -209,10 +202,7 @@ impl DatabaseManager {
         }
     }
 
-    pub async fn list<'db>(
-        &self,
-        table: TableDefinition<'db, &str, &[u8]>,
-    ) -> Result<Vec<Vec<u8>>> {
+    pub fn list<'db>(&self, table: TableDefinition<'db, &str, &[u8]>) -> Result<Vec<Vec<u8>>> {
         // read from database (L2)
         let read_txn = self.db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
@@ -230,7 +220,7 @@ impl DatabaseManager {
     }
 
     /// Delete from both cache and DB
-    pub async fn delete<'db>(
+    pub fn delete<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -256,7 +246,7 @@ impl DatabaseManager {
 
         // Step 2: Delete from cache (L1)
         if self.has_cache {
-            self.memory_cache.invalidate(&cache_key).await;
+            self.memory_cache.invalidate(&cache_key);
         }
 
         if found {
@@ -269,7 +259,7 @@ impl DatabaseManager {
         Ok(found)
     }
 
-    pub async fn restore_by_version<'db>(
+    pub fn restore_by_version<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -322,7 +312,7 @@ impl DatabaseManager {
                     // Cache
                     if self.has_cache {
                         let cache_key = format!("{}:{}", table_name, key);
-                        self.memory_cache.insert(cache_key, data.clone()).await;
+                        self.memory_cache.insert(cache_key, data.clone());
                     }
                 }
 
@@ -340,22 +330,17 @@ impl DatabaseManager {
 
                 if self.has_cache {
                     let cache_key = format!("{}:{}", table_name, key);
-                    self.memory_cache.invalidate(&cache_key).await;
+                    self.memory_cache.invalidate(&cache_key);
                 }
 
                 bm.record_restore(table, table_name, key, version, None, None)?;
             }
         }
 
-        self.emitter.info(format!(
-            "restored → {}:{} from v{}",
-            table_name, key, version
-        ));
-
         Ok(())
     }
 
-    pub async fn get_by_version<'db>(
+    pub fn get_by_version<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
@@ -380,7 +365,7 @@ impl DatabaseManager {
         record
     }
 
-    pub async fn restore_at<'db>(
+    pub fn restore_at<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -404,10 +389,9 @@ impl DatabaseManager {
 
         // Same logic as restore_by_version
         self.restore_by_version(table, table_name, key, target_version)
-            .await
     }
 
-    pub async fn get_version_by_at<'db>(
+    pub fn get_version_by_at<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
@@ -426,11 +410,7 @@ impl DatabaseManager {
             .ok_or_else(|| ClError::NotFound("no record at this timestamp".into()))
     }
 
-    pub async fn set_bulk<'db>(
-        &self,
-        table_name: &str,
-        entries: Vec<(String, u64)>,
-    ) -> Result<String> {
+    pub fn set_bulk<'db>(&self, table_name: &str, entries: Vec<(String, u64)>) -> Result<String> {
         let bm = self
             .backup_manager
             .as_ref()
@@ -438,7 +418,7 @@ impl DatabaseManager {
         bm.write_bulk(table_name, entries)
     }
 
-    pub async fn restore_bulk<'db>(
+    pub fn restore_bulk<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         table_name: &str,
@@ -470,7 +450,7 @@ impl DatabaseManager {
                     write_txn.commit()?;
                     if self.has_cache {
                         let cache_key = format!("{}:{}", table_name, key);
-                        self.memory_cache.insert(cache_key, d).await;
+                        self.memory_cache.insert(cache_key, d);
                     }
                 }
                 None => {
@@ -481,7 +461,7 @@ impl DatabaseManager {
                     write_txn.commit()?;
                     if self.has_cache {
                         let cache_key = format!("{}:{}", table_name, key);
-                        self.memory_cache.invalidate(&cache_key).await;
+                        self.memory_cache.invalidate(&cache_key);
                     }
                 }
             }
@@ -490,7 +470,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    pub async fn current_version<'db>(&self, table_name: &str, id: &str) -> Result<u64> {
+    pub fn current_version<'db>(&self, table_name: &str, id: &str) -> Result<u64> {
         let bm = self
             .backup_manager
             .as_ref()
@@ -498,7 +478,7 @@ impl DatabaseManager {
         bm.current_version(table_name, id)
     }
 
-    pub async fn history<'db>(
+    pub fn history<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
@@ -531,26 +511,14 @@ pub struct Dir {
 }
 
 impl Dir {
-    pub async fn new(
-        dir: &PathBuf,
-        backup_dir: Option<&PathBuf>,
-        emitter: &Arc<EventEmitter>,
-    ) -> Result<Self> {
+    pub fn new(dir: &PathBuf, backup_dir: Option<&PathBuf>) -> Result<Self> {
         if !dir.exists() {
-            fs::create_dir_all(&dir).await?;
-            emitter.info(
-                format!(
-                    "✅ {} initialized",
-                    dir.to_str().ok_or_else(|| ClError::OptionNone)?
-                )
-                .as_str(),
-            );
+            fs::create_dir_all(&dir)?;
         }
 
         let backup_dir_set = if let Some(backup) = backup_dir {
             if !backup.exists() {
-                fs::create_dir_all(backup).await?;
-                emitter.info(format!("✅ {} initialized", backup.display()).as_str());
+                fs::create_dir_all(backup)?;
             }
             Some(backup.to_path_buf())
         } else {
@@ -580,9 +548,9 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         }
     }
 
-    pub async fn get(&self, id: &str) -> Result<T> {
+    pub fn get(&self, id: &str) -> Result<T> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let data = self.database_manager.get(table, self.table, id).await?;
+        let data = self.database_manager.get(table, self.table, id)?;
         if let Some(data) = data {
             let value: T = serde_json::from_slice(&data)?;
             Ok(value)
@@ -591,9 +559,9 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         }
     }
 
-    pub async fn list(&self) -> Result<Vec<T>> {
+    pub fn list(&self) -> Result<Vec<T>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let data = self.database_manager.list(table).await?;
+        let data = self.database_manager.list(table)?;
 
         Ok(data
             .iter()
@@ -605,42 +573,32 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .collect_vec())
     }
 
-    pub async fn set(&self, id: &str, value: &T) -> Result<()> {
+    pub fn set(&self, id: &str, value: &T) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let data = serde_json::to_vec(value)?;
-        self.database_manager
-            .set(table, self.table, id, data)
-            .await?;
+        self.database_manager.set(table, self.table, id, data)?;
         Ok(())
     }
 
-    pub async fn set_bulk(&self, entries: Vec<(String, u64)>) -> Result<String> {
-        self.database_manager.set_bulk(self.table, entries).await
+    pub fn set_bulk(&self, entries: Vec<(String, u64)>) -> Result<String> {
+        self.database_manager.set_bulk(self.table, entries)
     }
 
-    pub async fn delete(&self, id: &str) -> Result<()> {
+    pub fn delete(&self, id: &str) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        self.database_manager.delete(table, self.table, id).await?;
+        self.database_manager.delete(table, self.table, id)?;
         Ok(())
     }
 
-    pub async fn restore_by_version(&self, id: &str, version: u64) -> Result<()> {
+    pub fn restore_by_version(&self, id: &str, version: u64) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
             .restore_by_version(table, self.table, id, version)
-            .await
     }
 
-    pub async fn get_by_version(
-        &self,
-        id: &str,
-        version: u64,
-    ) -> Result<BackupRecordRepository<T>> {
+    pub fn get_by_version(&self, id: &str, version: u64) -> Result<BackupRecordRepository<T>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let record = self
-            .database_manager
-            .get_by_version(table, id, version)
-            .await?;
+        let record = self.database_manager.get_by_version(table, id, version)?;
 
         let data = if let Some(data) = record.data {
             let value = serde_json::from_slice(&data)?;
@@ -662,16 +620,11 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         })
     }
 
-    pub async fn get_version_by_at(
-        &self,
-        id: &str,
-        timestamp: i64,
-    ) -> Result<BackupRecordRepository<T>> {
+    pub fn get_version_by_at(&self, id: &str, timestamp: i64) -> Result<BackupRecordRepository<T>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let record = self
             .database_manager
-            .get_version_by_at(table, id, timestamp)
-            .await?;
+            .get_version_by_at(table, id, timestamp)?;
 
         let data = if let Some(data) = record.data {
             let value = serde_json::from_slice(&data)?;
@@ -693,26 +646,23 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         })
     }
 
-    pub async fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
+    pub fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
             .restore_at(table, self.table, id, timestamp)
-            .await
     }
 
-    pub async fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
+    pub fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager
             .restore_bulk(table, self.table, bulk_id)
-            .await
     }
 
-    pub async fn history(&self, id: &str) -> Result<Vec<BackupRecordRepository<T>>> {
+    pub fn history(&self, id: &str) -> Result<Vec<BackupRecordRepository<T>>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let history = self
             .database_manager
-            .history(table, id)
-            .await?
+            .history(table, id)?
             .into_iter()
             .map(|record| {
                 let data = if let Some(data) = record.data {
@@ -739,8 +689,8 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         Ok(history)
     }
 
-    pub async fn current_version(&self, id: &str) -> Result<u64> {
-        self.database_manager.current_version(self.table, id).await
+    pub fn current_version(&self, id: &str) -> Result<u64> {
+        self.database_manager.current_version(self.table, id)
     }
 }
 

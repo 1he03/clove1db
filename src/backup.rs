@@ -1,6 +1,6 @@
 // backup.rs
 use crate::units::ClError;
-use crate::{event_emitter::EventEmitter, units::Result};
+use crate::units::Result;
 use chrono::Local;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::PathBuf;
@@ -53,19 +53,17 @@ pub struct BulkRecord {
 #[derive(Clone, Debug)]
 pub struct BackupManager {
     pub db: Arc<Database>,
-    emitter: Arc<EventEmitter>,
     has_cache: bool,
 }
 
 impl BackupManager {
-    pub fn new(path: &PathBuf, emitter: EventEmitter, has_cache: bool) -> Result<Self> {
+    pub fn new(path: &PathBuf, has_cache: bool) -> Result<Self> {
         // Last version in any table — we will search later when using
         // The tables are created in DatabaseManager::new() ✅
         let db =
             Arc::new(Database::create(path).map_err(|e| ClError::Database(redb::Error::from(e)))?);
         Ok(Self {
             db: db.clone(),
-            emitter: Arc::new(emitter),
             has_cache,
         })
     }
@@ -109,7 +107,7 @@ impl BackupManager {
             restored_version: None,
             bulk_id: None,
         };
-        self.write(table, table_name, key, version, &record)
+        self.write(table, key, version, &record)
     }
 
     /// Called from DatabaseManager::delete()
@@ -132,7 +130,7 @@ impl BackupManager {
             restored_version: None,
             bulk_id: None,
         };
-        self.write(table, table_name, key, version, &record)
+        self.write(table, key, version, &record)
     }
 
     pub fn record_restore<'db>(
@@ -158,7 +156,7 @@ impl BackupManager {
             bulk_id,
         };
 
-        self.write(table, table_name, key, version, &record)
+        self.write(table, key, version, &record)
     }
 
     pub fn restore_bulk<'db>(
@@ -231,12 +229,6 @@ impl BackupManager {
 
             results.push((entry.key.clone(), data));
         }
-
-        self.emitter.info(format!(
-            "bulk restored → {} | {} entries",
-            bulk_id,
-            results.len()
-        ));
 
         Ok(results)
     }
@@ -353,7 +345,6 @@ impl BackupManager {
     fn write<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
-        table_name: &str,
         key: &str,
         version: u64,
         record: &BackupRecord,
@@ -375,11 +366,6 @@ impl BackupManager {
         }
         write_txn.commit()?;
 
-        self.emitter.debug(format!(
-            "backup [{:?}] {}:{} v{}",
-            record.operation, table_name, key, version
-        ));
-
         Ok(())
     }
 
@@ -395,7 +381,7 @@ impl BackupManager {
 
         let bulk_id = uuid::Uuid::new_v4().to_string();
 
-        let record = {
+        {
             let record = BulkRecord {
                 bulk_id: bulk_id.clone(),
                 timestamp: Local::now().timestamp_millis(),
@@ -421,12 +407,6 @@ impl BackupManager {
             write_txn.commit()?;
             record
         };
-
-        self.emitter.info(format!(
-            "bulk saved → {} | {} entries",
-            bulk_id,
-            record.entries.len()
-        ));
 
         Ok(bulk_id)
     }
