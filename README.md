@@ -15,7 +15,7 @@ A lightweight embedded database framework for Rust — built on redb with layere
 
 ```toml
 [dependencies]
-clove1db = "0.0.35"
+clove1db = "0.0.42"
 
 ```
 

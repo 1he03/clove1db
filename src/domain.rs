@@ -183,6 +183,10 @@ impl<E: Entity> Domain<E> {
         Ok(history)
     }
 
+    pub fn current_version(&self, id: &str) -> Result<u64> {
+        self.repository.current_version(id)
+    }
+
     pub fn repo(&self) -> &Repository<E> {
         &self.repository
     }
